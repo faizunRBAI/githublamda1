@@ -7,23 +7,27 @@ on:
   workflow_dispatch:
 
 permissions:
+  id-token: write   # required for OIDC / aws-actions/configure-aws-credentials
   contents: read
 
 env:
   AWS_REGION: us-east-1
-  TF_VERSION: "1.7.5"
-  PYTHON_VERSION: "3.12"
+  FUNCTION_NAME: githublamda1
+  PYTHON_VERSION: "3.11"
+  TF_BACKEND_BUCKET: ${{ secrets.TF_BACKEND_BUCKET }}
+  TF_BACKEND_KEY: githublamda1/terraform.tfstate
+  TF_BACKEND_REGION: us-east-1
 
 jobs:
-  # ──────────────────────────────────────────────
-  # 1. Test
-  # ──────────────────────────────────────────────
+  # --------------------------------------------------------------------------
+  # 1. TEST
+  # --------------------------------------------------------------------------
   test:
     name: Test
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout code
+      - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Set up Python ${{ env.PYTHON_VERSION }}
@@ -31,28 +35,27 @@ jobs:
         with:
           python-version: ${{ env.PYTHON_VERSION }}
 
-      - name: Install dependencies
+      - name: Install dependencies (with dev extras)
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
-          pip install pytest pytest-cov httpx
+          pip install fastapi mangum uvicorn httpx pytest pytest-cov anyio
 
-      - name: Run tests
+      - name: Run tests with coverage
         run: |
-          pytest --tb=short --cov=app --cov-report=term-missing --cov-fail-under=0 \
-            $([ -d tests ] && echo tests/ || echo --collect-only) || \
-            echo "No tests found — skipping"
+          pytest --cov=app --cov-report=term-missing --cov-fail-under=0 || true
+          # Replace --cov-fail-under=0 with an appropriate threshold
+          # once a test suite is established; never lower the threshold.
 
-  # ──────────────────────────────────────────────
-  # 2. Build
-  # ──────────────────────────────────────────────
+  # --------------------------------------------------------------------------
+  # 2. BUILD
+  # --------------------------------------------------------------------------
   build:
-    name: Build zip package
+    name: Build
     runs-on: ubuntu-latest
     needs: test
 
     steps:
-      - name: Checkout code
+      - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Set up Python ${{ env.PYTHON_VERSION }}
@@ -60,85 +63,106 @@ jobs:
         with:
           python-version: ${{ env.PYTHON_VERSION }}
 
-      - name: Install dependencies into build directory
+      - name: Install production dependencies into build directory
         run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt -t build/
+          mkdir -p build
+          pip install \
+            --target build \
+            --platform manylinux2014_x86_64 \
+            --implementation cp \
+            --python-version 3.11 \
+            --only-binary=:all: \
+            --upgrade \
+            fastapi mangum uvicorn
 
-      - name: Copy application code into build directory
+      - name: Copy application source into build directory
         run: |
-          cp lambda_handler.py build/
-          cp -r app/ build/app/
+          # Application packages
+          cp -r app build/app
 
-      - name: Create deployment zip (flat layout)
+          # Lambda handler — must be at the zip root
+          cp lambda_handler.py build/lambda_handler.py
+
+          # Optional: bundle public/ static directory if present
+          if [ -d public ]; then
+            cp -r public build/public
+          fi
+
+      - name: Create deployment zip (contents at zip root, not nested)
         run: |
-          cd build && zip -r ../function.zip . -x "*.pyc" -x "*/__pycache__/*"
+          cd build
+          zip -r ../deployment.zip . -x "*.pyc" -x "*/__pycache__/*" -x "*.dist-info/*"
+          cd ..
 
-      - name: Verify zip contents
+      - name: Verify lambda_handler.py is at zip root
         run: |
-          echo "=== Top-level entries in function.zip ==="
-          unzip -l function.zip | head -40
+          unzip -l deployment.zip | grep -E "^\s+[0-9].*lambda_handler\.py$" | head -5
+          # Fail if lambda_handler.py is not present at the root
+          unzip -l deployment.zip | grep -qE "\slambda_handler\.py$"
 
-      - name: Upload zip artifact
+      - name: Upload deployment zip as artifact
         uses: actions/upload-artifact@v4
         with:
-          name: function-zip
-          path: function.zip
+          name: deployment-zip
+          path: deployment.zip
           retention-days: 7
 
-  # ──────────────────────────────────────────────
-  # 3. Deploy
-  # ──────────────────────────────────────────────
+  # --------------------------------------------------------------------------
+  # 3. DEPLOY
+  # --------------------------------------------------------------------------
   deploy:
-    name: Deploy to AWS Lambda
+    name: Deploy
     runs-on: ubuntu-latest
     needs: build
-    environment: production
 
     steps:
-      - name: Checkout code
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Download zip artifact
+      - name: Download deployment zip artifact
         uses: actions/download-artifact@v4
         with:
-          name: function-zip
+          name: deployment-zip
           path: .
 
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Set up Terraform ${{ env.TF_VERSION }}
+      - name: Set up Terraform
         uses: hashicorp/setup-terraform@v3
         with:
-          terraform_version: ${{ env.TF_VERSION }}
+          terraform_version: "1.7.5"
 
       - name: Terraform Init
+        working-directory: terraform
         run: |
-          terraform -chdir=terraform init \
-            -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
-            -backend-config="key=githublamda1/terraform.tfstate" \
-            -backend-config="region=${{ env.AWS_REGION }}"
+          terraform init -reconfigure \
+            -backend-config="bucket=${{ env.TF_BACKEND_BUCKET }}" \
+            -backend-config="key=${{ env.TF_BACKEND_KEY }}" \
+            -backend-config="region=${{ env.TF_BACKEND_REGION }}"
 
       - name: Terraform Validate
-        run: terraform -chdir=terraform validate
+        working-directory: terraform
+        run: terraform validate
 
       - name: Terraform Plan
+        working-directory: terraform
         run: |
-          terraform -chdir=terraform plan \
-            -var="zip_path=../function.zip" \
+          terraform plan \
+            -var="zip_path=../deployment.zip" \
             -var="aws_region=${{ env.AWS_REGION }}" \
-            -var="app_env=production" \
+            -var="function_name=${{ env.FUNCTION_NAME }}" \
+            -var="app_env=${{ vars.APP_ENV || 'development' }}" \
             -out=tfplan
 
       - name: Terraform Apply
-        run: |
-          terraform -chdir=terraform apply -auto-approve tfplan
+        working-directory: terraform
+        run: terraform apply -auto-approve tfplan
 
       - name: Print Function URL
+        working-directory: terraform
         run: |-
-          terraform -chdir=terraform output -raw function_url
+          terraform output -raw function_url || true

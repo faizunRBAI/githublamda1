@@ -4,7 +4,7 @@ terraform {
   required_providers {
     aws = {
       source  = "hashicorp/aws"
-      version = "~> 5.0"
+      version = "~> 5.40"
     }
   }
 
@@ -15,9 +15,10 @@ provider "aws" {
   region = var.aws_region
 }
 
-# ──────────────────────────────────────────────
+# ---------------------------------------------------------------------------
 # Variables
-# ──────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+
 variable "aws_region" {
   description = "AWS region to deploy into"
   type        = string
@@ -30,21 +31,33 @@ variable "function_name" {
   default     = "githublamda1"
 }
 
+variable "zip_path" {
+  description = "Local path to the deployment zip artifact"
+  type        = string
+  default     = "deployment.zip"
+}
+
 variable "app_env" {
   description = "Application environment (development | staging | production)"
   type        = string
   default     = "development"
 }
 
-variable "zip_path" {
-  description = "Local path to the deployment zip archive produced by CI"
+variable "function_url_auth_type" {
+  description = "AuthType for the Lambda Function URL (NONE or AWS_IAM)"
   type        = string
-  default     = "function.zip"
+  default     = "NONE"
+
+  validation {
+    condition     = contains(["NONE", "AWS_IAM"], var.function_url_auth_type)
+    error_message = "function_url_auth_type must be NONE or AWS_IAM."
+  }
 }
 
-# ──────────────────────────────────────────────
-# IAM role for Lambda
-# ──────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# IAM — execution role
+# ---------------------------------------------------------------------------
+
 data "aws_iam_policy_document" "lambda_assume_role" {
   statement {
     effect  = "Allow"
@@ -60,77 +73,93 @@ data "aws_iam_policy_document" "lambda_assume_role" {
 resource "aws_iam_role" "lambda_exec" {
   name               = "${var.function_name}-exec-role"
   assume_role_policy = data.aws_iam_policy_document.lambda_assume_role.json
+
+  tags = {
+    Project = var.function_name
+  }
 }
 
-resource "aws_iam_role_policy_attachment" "lambda_basic_execution" {
+resource "aws_iam_role_policy_attachment" "basic_execution" {
   role       = aws_iam_role.lambda_exec.name
   policy_arn = "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
 }
 
-# ──────────────────────────────────────────────
+# ---------------------------------------------------------------------------
 # Lambda function
-# ──────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+
 resource "aws_lambda_function" "app" {
   function_name = var.function_name
-  description   = "FastAPI application deployed via Mangum"
+  description   = "FastAPI application wrapped with Mangum"
+
+  # Runtime — must be python3.11
+  runtime = "python3.11"
+
+  # Handler — must be exactly lambda_handler.handler
+  handler = "lambda_handler.handler"
 
   filename         = var.zip_path
   source_code_hash = filebase64sha256(var.zip_path)
 
-  runtime = "python3.12"
-  handler = "lambda_handler.handler"
-
   role = aws_iam_role.lambda_exec.arn
 
-  timeout     = 30
+  # Give the function enough memory and time for a cold start
   memory_size = 256
+  timeout     = 30
 
   environment {
     variables = {
       APP_ENV = var.app_env
+      # PORT and HOST are intentionally omitted — Lambda does not use them
     }
   }
-}
 
-# ──────────────────────────────────────────────
-# Lambda Function URL (public, no auth)
-# ──────────────────────────────────────────────
-resource "aws_lambda_function_url" "app" {
-  function_name      = aws_lambda_function.app.function_name
-  authorization_type = "NONE"
-
-  cors {
-    allow_credentials = false
-    allow_origins     = ["*"]
-    allow_methods     = ["*"]
-    allow_headers     = ["*"]
-    expose_headers    = ["*"]
-    max_age           = 86400
+  tags = {
+    Project = var.function_name
   }
 }
 
-# ──────────────────────────────────────────────
-# CloudWatch log group with retention
-# ──────────────────────────────────────────────
-resource "aws_cloudwatch_log_group" "app" {
-  name              = "/aws/lambda/${var.function_name}"
-  retention_in_days = 14
+# ---------------------------------------------------------------------------
+# Lambda Function URL
+# ---------------------------------------------------------------------------
+
+resource "aws_lambda_function_url" "app" {
+  function_name      = aws_lambda_function.app.function_name
+  authorization_type = var.function_url_auth_type
+
+  # BUFFERED invoke mode as required by the contract
+  invoke_mode = "BUFFERED"
 }
 
-# ──────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Resource-based policy — allow public invocation when AuthType is NONE
+# ---------------------------------------------------------------------------
+
+resource "aws_lambda_permission" "function_url_invoke" {
+  count = var.function_url_auth_type == "NONE" ? 1 : 0
+
+  statement_id           = "AllowFunctionURLPublicAccess"
+  action                 = "lambda:InvokeFunctionUrl"
+  function_name          = aws_lambda_function.app.function_name
+  principal              = "*"
+  function_url_auth_type = "NONE"
+}
+
+# ---------------------------------------------------------------------------
 # Outputs
-# ──────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+
 output "function_name" {
-  description = "Lambda function name"
+  description = "Name of the deployed Lambda function"
   value       = aws_lambda_function.app.function_name
 }
 
 output "function_arn" {
-  description = "Lambda function ARN"
+  description = "ARN of the deployed Lambda function"
   value       = aws_lambda_function.app.arn
 }
 
 output "function_url" {
-  description = "Lambda Function URL (public endpoint)"
+  description = "HTTPS endpoint of the Lambda Function URL"
   value       = aws_lambda_function_url.app.function_url
 }
